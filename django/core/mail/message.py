@@ -7,13 +7,15 @@ import time
 from email import (
     charset as Charset, encoders as Encoders, generator, message_from_string,
 )
+from email.errors import HeaderParseError
 from email.header import Header
+from email.headerregistry import Address, parser
 from email.message import Message
 from email.mime.base import MIMEBase
 from email.mime.message import MIMEMessage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate, getaddresses, parseaddr
+from email.utils import formatdate, getaddresses, formataddr
 from io import BytesIO
 
 from django.conf import settings
@@ -131,38 +133,45 @@ def sanitize_address(addr, encoding):
     """
     Format a pair of (name, address) or an email address string.
     """
+    address = None
     if not isinstance(addr, tuple):
-        addr = parseaddr(force_text(addr))
-    nm, addr = addr
-    localpart, domain = None, None
-    nm = Header(nm, encoding).encode()
+        addr = force_text(addr)
+        try:
+            token, rest = parser.get_mailbox(addr)
+        except (HeaderParseError, ValueError, IndexError):
+            raise ValueError('Invalid address "%s"' % addr)
+        else:
+            if rest:
+                # The entire email address must be parsed.
+                raise ValueError(
+                    'Invalid address; only %s could be parsed from "%s"'
+                    % (token, addr)
+                )
+            nm = token.display_name or ''
+            localpart = token.local_part
+            domain = token.domain or ''
+    else:
+        nm, address = addr
+        localpart, domain = address.rsplit('@', 1)
+
+    address_parts = nm + localpart + domain
+    if '\n' in address_parts or '\r' in address_parts:
+        raise ValueError('Invalid address; address parts cannot contain newlines.')
+
+    # Avoid UTF-8 encode, if it's possible.
     try:
-        addr.encode('ascii')
-    except UnicodeEncodeError:  # IDN or non-ascii in the local part
-        localpart, domain = split_addr(addr, encoding)
-
-    if six.PY2:
-        # On Python 2, use the stdlib since `email.headerregistry` doesn't exist.
-        from email.utils import formataddr
-        if localpart and domain:
-            addr = '@'.join([localpart, domain])
-        return formataddr((nm, addr))
-
-    # On Python 3, an `email.headerregistry.Address` object is used since
-    # email.utils.formataddr() naively encodes the name as ascii (see #25986).
-    from email.headerregistry import Address
-    from email.errors import InvalidHeaderDefect, NonASCIILocalPartDefect
-
-    if localpart and domain:
-        address = Address(nm, username=localpart, domain=domain)
-        return str(address)
-
+        nm.encode('ascii')
+        nm = Header(nm).encode()
+    except UnicodeEncodeError:
+        nm = Header(nm, encoding).encode()
     try:
-        address = Address(nm, addr_spec=addr)
-    except (InvalidHeaderDefect, NonASCIILocalPartDefect):
-        localpart, domain = split_addr(addr, encoding)
-        address = Address(nm, username=localpart, domain=domain)
-    return str(address)
+        localpart.encode('ascii')
+    except UnicodeEncodeError:
+        localpart = Header(localpart, encoding).encode()
+    domain = domain.encode('idna').decode('ascii')
+
+    parsed_address = Address(username=localpart, domain=domain)
+    return formataddr((nm, parsed_address.addr_spec))
 
 
 class MIMEMixin():
